@@ -385,6 +385,58 @@ fun WorldMapScreen(
                                 collectible.longitude
                             )
                         }
+
+                        // ─── DIBUJADO DE ELEMENTOS DECORATIVOS ──────────────────────────
+                        @Suppress("UNCHECKED_CAST")
+                        val decorState = (view.getTag(ovh.gabrielhuav.pow.R.id.decorative_cache_tag)
+                            as? ovh.gabrielhuav.pow.features.map_exterior.ui.components.DecorativeElementManager.LayerState)
+                            ?: ovh.gabrielhuav.pow.features.map_exterior.ui.components.DecorativeElementManager.LayerState().also {
+                                view.setTag(ovh.gabrielhuav.pow.R.id.decorative_cache_tag, it)
+                            }
+
+                        val playerLat = uiState.currentLocation?.latitude ?: 0.0
+                        val playerLon = uiState.currentLocation?.longitude ?: 0.0
+
+                        if (ovh.gabrielhuav.pow.features.map_exterior.ui.components.DecorativeElementManager.needsRegen(decorState, playerLat, playerLon)) {
+                            decorState.elements = ovh.gabrielhuav.pow.features.map_exterior.ui.components.DecorativeElementManager.generate(playerLat, playerLon)
+                            decorState.lastLat = playerLat
+                            decorState.lastLon = playerLon
+                        }
+
+                        val activeDecorIds = decorState.elements.map { it.id }.toSet()
+                        val decorIterator = decorState.markerCache.iterator()
+                        while (decorIterator.hasNext()) {
+                            val entry = decorIterator.next()
+                            if (!activeDecorIds.contains(entry.key)) {
+                                view.overlays.remove(entry.value)
+                                decorIterator.remove()
+                            }
+                        }
+
+                        decorState.elements.forEach { elem ->
+                            val marker = decorState.markerCache[elem.id] ?: Marker(view).apply {
+                                setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                                setInfoWindow(null)
+                                isFlat = true
+                                decorState.markerCache[elem.id] = this
+                                view.overlays.add(this)
+                            }
+
+                            if (isZoomedIn) {
+                                val sizePx = (elem.type.sizeDp * screenDensity).toInt()
+                                val cacheKey = "DEC_${elem.type.name}_$sizePx"
+                                val icon = nativeDrawableCache.getOrPut(cacheKey) {
+                                    ovh.gabrielhuav.pow.features.map_exterior.ui.components.DecorativeElementManager
+                                        .getDrawable(context, elem.type, sizePx)
+                                }
+                                marker.icon = icon
+                                marker.setAlpha(1f)
+                            } else {
+                                marker.setAlpha(0f)
+                            }
+
+                            marker.position = org.osmdroid.util.GeoPoint(elem.lat, elem.lon)
+                        }
                     }
 
                     // ─── DIBUJADO DE LANDMARKS (con soporte de modo diseñador) ────────
