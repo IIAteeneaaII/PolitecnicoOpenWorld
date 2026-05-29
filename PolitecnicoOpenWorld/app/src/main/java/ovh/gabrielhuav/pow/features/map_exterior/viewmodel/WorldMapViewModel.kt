@@ -43,12 +43,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.atan2
 import kotlin.math.cos
-import kotlin.math.floor
-import kotlin.math.max
-import kotlin.math.min
-import kotlin.math.pow
 import kotlin.math.sin
-import kotlin.math.sqrt
 import kotlin.math.abs
 import ovh.gabrielhuav.pow.data.repository.CollectibleRepository
 import ovh.gabrielhuav.pow.domain.models.ActiveCollectible
@@ -163,7 +158,7 @@ class WorldMapViewModel(
     private val npcAiManager      = NpcAiManager()
     private val overpassRepository = OverpassRepository()
     private var roadNetwork: List<MapWay> = emptyList()
-    private var roadNetworkNodeGrid: Map<Pair<Int, Int>, List<GeoPoint>> = emptyMap()
+    private val roadIndex = RoadNetworkIndex()
     private var routeCalculationJob: Job? = null
     private var routeRetryJob: Job? = null
     private var lastNetworkFetchLocation: GeoPoint? = null
@@ -174,8 +169,6 @@ class WorldMapViewModel(
 
     private val REFETCH_DISTANCE_DEG = 0.015
     private val REFETCH_COOLDOWN_MS  = 5 * 60 * 1000L
-    private val ROAD_NODE_GRID_SIZE_DEG = 0.001
-
     var isSteeringLeftPressed = false
     var isSteeringRightPressed = false
     var isGasPressed = false
@@ -526,8 +519,8 @@ class WorldMapViewModel(
 
                             val tempLoc = GeoPoint(location.latitude + dy, location.longitude + dx)
 
-                            val nearestRoadPoint = getNearestPointOnNetwork(tempLoc)
-                            val distToRoad = distance(tempLoc, nearestRoadPoint)
+                            val nearestRoadPoint = roadIndex.getNearestPoint(tempLoc, roadNetwork)
+                            val distToRoad = roadIndex.distance(tempLoc, nearestRoadPoint)
                             val maxRoadRadius = 0.000025
 
                             val finalLoc = if (distToRoad <= maxRoadRadius) {
@@ -641,7 +634,7 @@ class WorldMapViewModel(
 
     private suspend fun applyRoadNetwork(network: List<MapWay>, playerLocation: GeoPoint) {
         roadNetwork = network
-        rebuildRoadNodeGrid(network)
+        roadIndex.rebuild(network)
         npcAiManager.updateRoadNetwork(network)
 
         // Solo intentamos spawnear la mano si estamos en ESCOM.
@@ -653,7 +646,7 @@ class WorldMapViewModel(
             _uiState.update { it.copy(isZombieHandSpawned = false) }
         }
 
-        val snapped = withContext(Dispatchers.Default) { getNearestPointOnNetwork(playerLocation) }
+        val snapped = withContext(Dispatchers.Default) { roadIndex.getNearestPoint(playerLocation, roadNetwork) }
         withContext(Dispatchers.Main) {
             _uiState.update { it.copy(currentLocation = snapped, isRoadNetworkReady = true) }
         }
@@ -674,7 +667,7 @@ class WorldMapViewModel(
 
     private fun maybeRefetchRoadNetwork(currentLoc: org.osmdroid.util.GeoPoint) {
         val moved = if (lastNetworkFetchLocation != null)
-            distance(lastNetworkFetchLocation!!, currentLoc) else Double.MAX_VALUE
+            roadIndex.distance(lastNetworkFetchLocation!!, currentLoc) else Double.MAX_VALUE
         if (moved < REFETCH_DISTANCE_DEG) return
 
         val now = System.currentTimeMillis()
@@ -755,8 +748,8 @@ class WorldMapViewModel(
             Direction.LEFT  -> GeoPoint(loc.latitude, loc.longitude - step)
             Direction.RIGHT -> GeoPoint(loc.latitude, loc.longitude + step)
         }
-        val nearest = getNearestPointOnNetwork(temp)
-        val dist    = distance(temp, nearest)
+        val nearest = roadIndex.getNearestPoint(temp, roadNetwork)
+        val dist    = roadIndex.distance(temp, nearest)
         val radius  = 0.000012
         if (dist <= radius) {
             _uiState.update { it.copy(currentLocation = temp) }
@@ -785,8 +778,8 @@ class WorldMapViewModel(
             loc.longitude + cos(angleRad) * step
         )
 
-        val nearest = getNearestPointOnNetwork(temp)
-        val dist = distance(temp, nearest)
+        val nearest = roadIndex.getNearestPoint(temp, roadNetwork)
+        val dist = roadIndex.distance(temp, nearest)
         val radius = 0.000012
 
         if (dist <= radius) {
@@ -803,65 +796,6 @@ class WorldMapViewModel(
     fun updateControlSettings(type: ControlType, scale: Float, swap: Boolean) {
         _uiState.update { it.copy(controlType = type, controlsScale = scale, swapControls = swap) }
     }
-
-    private data class Seg(val s: GeoPoint, val e: GeoPoint,
-                           val minLat: Double, val maxLat: Double, val minLon: Double, val maxLon: Double)
-
-    private val CELL = 0.0025
-    private var indexedRef: List<MapWay>?    = null
-    private var segs: List<Seg>              = emptyList()
-    private var grid: Map<Long, List<Seg>>   = emptyMap()
-
-    private fun ensureIndex() {
-        if (indexedRef === roadNetwork) return
-        val newSegs = ArrayList<Seg>(roadNetwork.sumOf { it.nodes.size })
-        val newGrid = HashMap<Long, MutableList<Seg>>()
-        for (way in roadNetwork) {
-            for (i in 0 until way.nodes.size - 1) {
-                val a = way.nodes[i]; val b = way.nodes[i + 1]
-                val seg = Seg(GeoPoint(a.lat, a.lon), GeoPoint(b.lat, b.lon),
-                    min(a.lat, b.lat), max(a.lat, b.lat), min(a.lon, b.lon), max(a.lon, b.lon))
-                newSegs.add(seg)
-                for (r in cell(seg.minLat)..cell(seg.maxLat))
-                    for (c in cell(seg.minLon)..cell(seg.maxLon))
-                        newGrid.getOrPut(pack(r, c)) { mutableListOf() }.add(seg)
-            }
-        }
-        indexedRef = roadNetwork; segs = newSegs; grid = newGrid
-    }
-
-    private fun candidates(loc: GeoPoint): List<Seg> {
-        val r = cell(loc.latitude); val c = cell(loc.longitude)
-        val res = LinkedHashSet<Seg>()
-        for (dr in -1..1) for (dc in -1..1) grid[pack(r + dr, c + dc)]?.let { res.addAll(it) }
-        return if (res.isNotEmpty()) res.toList() else segs
-    }
-
-    private fun pack(r: Int, c: Int): Long = r.toLong() * 1_000_003L + c.toLong()
-    private fun cell(v: Double): Int = floor(v / CELL).toInt()
-
-    private fun getNearestPointOnNetwork(t: GeoPoint): GeoPoint {
-        ensureIndex()
-        val cands = candidates(t); if (cands.isEmpty()) return t
-        var best = Double.MAX_VALUE; var pt = t
-        for (seg in cands) {
-            val p = project(t, seg.s, seg.e); val d = distance(t, p)
-            if (d < best) { best = d; pt = p }
-        }
-        return pt
-    }
-
-    private fun project(p: GeoPoint, v: GeoPoint, w: GeoPoint): GeoPoint {
-        val l2 = (w.latitude - v.latitude).pow(2) + (w.longitude - v.longitude).pow(2)
-        if (l2 == 0.0) return v
-        val t = max(0.0, min(1.0, ((p.latitude - v.latitude) * (w.latitude - v.latitude) +
-                (p.longitude - v.longitude) * (w.longitude - v.longitude)) / l2))
-        return GeoPoint(v.latitude + t * (w.latitude - v.latitude),
-            v.longitude + t * (w.longitude - v.longitude))
-    }
-
-    private fun distance(a: GeoPoint, b: GeoPoint): Double =
-        sqrt((a.latitude - b.latitude).pow(2) + (a.longitude - b.longitude).pow(2))
 
     fun updateInitialLocation(lat: Double, lon: Double) {
         if (_uiState.value.isLoadingLocation)
@@ -951,8 +885,8 @@ class WorldMapViewModel(
 
         if (!_uiState.value.isDriving) {
             val nearbyCarEntry = remoteEntities.entries
-                .filter { it.value.type == NpcType.CAR && distance(loc, it.value.location) <= INTERACT_RADIUS }
-                .minByOrNull { distance(loc, it.value.location) }
+                .filter { it.value.type == NpcType.CAR && roadIndex.distance(loc, it.value.location) <= INTERACT_RADIUS }
+                .minByOrNull { roadIndex.distance(loc, it.value.location) }
 
             if (nearbyCarEntry != null) {
                 val carId = nearbyCarEntry.key
@@ -1226,7 +1160,7 @@ class WorldMapViewModel(
                     val offsetLat = playerLat + deltaLat
                     val offsetLon = playerLon + deltaLon
                     val tempLoc = org.osmdroid.util.GeoPoint(offsetLat, offsetLon)
-                    val spawnNode = getNearestPointOnNetwork(tempLoc)
+                    val spawnNode = roadIndex.getNearestPoint(tempLoc, roadNetwork)
                     val activeItem = ActiveCollectible(
                         id = itemToSpawn.id,
                         name = itemToSpawn.name,
@@ -1344,7 +1278,7 @@ class WorldMapViewModel(
             _uiState.update { it.copy(showWastedScreen = true) }
             delay(4000L)
             val deathLoc = _uiState.value.currentLocation ?: GeoPoint(19.504505, -99.146911)
-            val nearestHospital = hospitalRespawnPoints.minByOrNull { distance(deathLoc, it) } ?: hospitalRespawnPoints.first()
+            val nearestHospital = hospitalRespawnPoints.minByOrNull { roadIndex.distance(deathLoc, it) } ?: hospitalRespawnPoints.first()
             _uiState.update { it.copy(currentLocation = nearestHospital, showWastedScreen = false) }
             playerHealth = maxPlayerHealth
         }
@@ -1366,9 +1300,9 @@ class WorldMapViewModel(
                 .filter {
                     !it.value.isDying &&
                             it.value.type == NpcType.PERSON &&
-                            distance(playerLoc, it.value.location) <= ATTACK_RADIUS
+                            roadIndex.distance(playerLoc, it.value.location) <= ATTACK_RADIUS
                 }
-                .minByOrNull { distance(playerLoc, it.value.location) }
+                .minByOrNull { roadIndex.distance(playerLoc, it.value.location) }
             if (targetNpcEntry != null) {
                 val npcId = targetNpcEntry.key
                 val currentNpc = targetNpcEntry.value
@@ -1445,7 +1379,7 @@ class WorldMapViewModel(
         routeCalculationJob = viewModelScope.launch(Dispatchers.Default) {
             try {
                 Log.d("Navigation", "Calculando ruta...")
-                val route = calculateRouteOnNetwork(currentLoc, destination, roadNetwork)
+                val route = roadIndex.calculateRoute(currentLoc, destination, roadNetwork)
                 Log.d("Navigation", "Ruta calculada con ${route.size} puntos")
                 withContext(Dispatchers.Main) {
                     _uiState.update { it.copy(routeWaypoints = if (route.isNotEmpty()) route else listOf(currentLoc, destination)) }
@@ -1457,78 +1391,6 @@ class WorldMapViewModel(
         }
     }
 
-    private fun calculateRouteOnNetwork(from: GeoPoint, to: GeoPoint, network: List<MapWay>): List<GeoPoint> {
-        if (network.isEmpty()) return listOf(from, to)
-        val route = mutableListOf<GeoPoint>()
-        route.add(from)
-        val startPoint = getNearestPointOnNetwork(from)
-        val endPoint = getNearestPointOnNetwork(to)
-        var current = startPoint
-        val visitedNodes = mutableSetOf<String>()
-        val maxSteps = 20
-        for (step in 0 until maxSteps) {
-            val distToTarget = distance(current, endPoint)
-            if (distToTarget < 0.0005) break
-            var bestNext: GeoPoint? = null
-            var bestDist = distToTarget
-            val candidateNodes = nearbyRoadNodes(current)
-            for (nodePt in candidateNodes) {
-                val nodeKey = "${nodePt.latitude},${nodePt.longitude}"
-                if (visitedNodes.contains(nodeKey)) continue
-                val dFromCurrent = distance(current, nodePt)
-                if (dFromCurrent < 0.003) {
-                    val dToTarget = distance(nodePt, endPoint)
-                    if (dToTarget < bestDist) {
-                        bestDist = dToTarget
-                        bestNext = nodePt
-                    }
-                }
-            }
-            if (bestNext != null) {
-                current = bestNext
-                visitedNodes.add("${current.latitude},${current.longitude}")
-                route.add(current)
-            } else break
-        }
-        route.add(endPoint)
-        route.add(to)
-        return route.distinctBy { "${it.latitude},${it.longitude}" }
-    }
-
-    private fun rebuildRoadNodeGrid(network: List<MapWay>) {
-        val uniqueNodes = linkedMapOf<String, GeoPoint>()
-        network.forEach { way ->
-            way.nodes.forEach { node ->
-                val key = "${node.lat},${node.lon}"
-                if (!uniqueNodes.containsKey(key)) uniqueNodes[key] = GeoPoint(node.lat, node.lon)
-            }
-        }
-        roadNetworkNodeGrid = uniqueNodes.values.groupBy { point ->
-            val latCell = floor(point.latitude / ROAD_NODE_GRID_SIZE_DEG).toInt()
-            val lonCell = floor(point.longitude / ROAD_NODE_GRID_SIZE_DEG).toInt()
-            latCell to lonCell
-        }
-    }
-
-    private fun nearbyRoadNodes(point: GeoPoint): List<GeoPoint> {
-        if (roadNetworkNodeGrid.isEmpty()) return emptyList()
-        val latCell = floor(point.latitude / ROAD_NODE_GRID_SIZE_DEG).toInt()
-        val lonCell = floor(point.longitude / ROAD_NODE_GRID_SIZE_DEG).toInt()
-        val nearby = mutableListOf<GeoPoint>()
-        for (latOffset in -1..1) {
-            for (lonOffset in -1..1) {
-                roadNetworkNodeGrid[(latCell + latOffset) to (lonCell + lonOffset)]?.let { nearby.addAll(it) }
-            }
-        }
-        if (nearby.isNotEmpty()) return nearby
-        return roadNetworkNodeGrid.values.flatten()
-    }
-
-    /**
-     * Spawnea UNA SOLA ZombiHand cerca del jugador (o en el centro de ESCOM).
-     * Al interactuar con ella, lleva al minijuego de zombis (que arranca en el
-     * lobby = croquis del campus). Antes spawneaba 6 manos, una por edificio.
-     */
     /**
      * Spawnea UNA SOLA ZombiHand, pero SOLO si el jugador está dentro de ESCOM.
      * Si no está en ESCOM, no hace nada (y deja la lista vacía).
@@ -1546,7 +1408,7 @@ class WorldMapViewModel(
         // Evita duplicar si ya hay una mano spawneada
         if (_uiState.value.isZombieHandSpawned && _escomItems.value.isNotEmpty()) return
 
-        val spawnPoint = if (roadNetwork.isNotEmpty()) getNearestPointOnNetwork(center) else center
+        val spawnPoint = if (roadNetwork.isNotEmpty()) roadIndex.getNearestPoint(center, roadNetwork) else center
 
         val hand = ActiveCollectible(
             id = "escom_hand_lobby",
@@ -1565,7 +1427,7 @@ class WorldMapViewModel(
         val loc = _uiState.value.currentLocation ?: return
         val interactionRadius = 0.00015
         val itemToCollect = _escomItems.value.find {
-            distance(loc, org.osmdroid.util.GeoPoint(it.latitude, it.longitude)) <= interactionRadius
+            roadIndex.distance(loc, org.osmdroid.util.GeoPoint(it.latitude, it.longitude)) <= interactionRadius
         }
 
         if (itemToCollect != null) {
