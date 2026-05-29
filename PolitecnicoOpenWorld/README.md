@@ -63,3 +63,28 @@ Se añadió un sistema de elementos decorativos puramente visuales al mapa del m
 - Se muestran un máximo de 50 elementos a la vez (los más cercanos al jugador). La lista se regenera únicamente cuando el jugador se desplaza más de ~150 m desde la última generación, sin costo adicional por frame.
 - Los elementos usan el mismo patrón de reciclado de `Marker` que los NPCs (sin crear objetos nuevos en cada frame) y se hacen invisibles al alejar el zoom por debajo de 16.5, idéntico al umbral de los NPCs.
 - Solo aplica al proveedor de mapas **OSM nativo**; la rama WebView (CartoDB, ESRI, etc.) no se ve afectada.
+
+---
+
+### 2026-05-29 — Refactor: Extracción de `RoadNetworkIndex` desde `WorldMapViewModel`
+
+Se extrajo toda la lógica de consulta espacial de la red vial a una clase dedicada para reducir el tamaño de `WorldMapViewModel` y mejorar la cohesión.
+
+**Archivos nuevos:**
+- `features/map_exterior/viewmodel/RoadNetworkIndex.kt` — Encapsula el índice espacial de segmentos de calles y el grid de nodos para consultas eficientes de proximidad y ruteo.
+
+**Archivos modificados:**
+- `features/map_exterior/viewmodel/WorldMapViewModel.kt` — Reducido de 1 646 a 1 508 líneas (−138). Todas las llamadas al índice espacial se delegan a `private val roadIndex = RoadNetworkIndex()`.
+
+**Qué contiene `RoadNetworkIndex`:**
+- Clase interna `Seg` (representación de segmentos de vía con bounding-box precalculado).
+- Índice espacial de doble grid: `segGrid` para snap-to-road y `nodeGrid` para ruteo.
+- `rebuild(network)` — reconstrucción eager del índice al cargar nueva red vial.
+- `getNearestPoint(t, network)` — proyección del punto más cercano sobre la red (con reconstrucción lazy si el network cambia).
+- `calculateRoute(from, to, network)` — cálculo de ruta greedy sobre nodos de la red.
+- `distance(a, b)` — distancia euclídea en grados (uso interno y en lógica de combate/interacción del ViewModel).
+
+**Detalles técnicos:**
+- La reconstrucción del índice es lazy mediante comparación de referencia (`===`), manteniendo el comportamiento original de `ensureIndex`.
+- Sin dependencias de Android ni de `StateFlow`; la clase es puramente algorítmica y testeable de forma aislada.
+- Los imports `kotlin.math.{floor, max, min, pow, sqrt}` se eliminaron del ViewModel al quedar exclusivos de `RoadNetworkIndex`.
