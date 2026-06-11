@@ -58,7 +58,7 @@ import java.io.InputStreamReader
 import ovh.gabrielhuav.pow.domain.models.ai.LandmarkNavGraph
 import ovh.gabrielhuav.pow.domain.models.ShineCTOLocation
 import ovh.gabrielhuav.pow.data.repository.MetroRepository
-
+import ovh.gabrielhuav.pow.domain.models.ExteriorCollisionsConfig
 
 class WorldMapViewModel(
     internal val roadNetworkCache: RoadNetworkCache,
@@ -673,55 +673,65 @@ class WorldMapViewModel(
                                 isAutoCentering = true
                             }
 
-                            val distToRoad = distance(tempLoc, nearestRoadPoint)
-                            // Expandimos el radio temporalmente para permitir salirnos un poco al rebasar
-                            val maxRoadRadius = if (dodgeOffsetX != 0.0 || dodgeOffsetY != 0.0 || isAutoCentering) 0.00006 else 0.00004
-
-                            val finalLoc = if (distToRoad <= maxRoadRadius) {
-                                tempLoc
-                            } else {
-                                // Te saliste (curva/bifurcación): en vez de "chocar y pararte", AUTO-DIRECCIONA
-                                // el coche hacia la calle y baja la velocidad de forma PROPORCIONAL (drástica
-                                // solo en desvíos grandes). Así, dejando acelerar, el coche SIGUE la carretera.
-                                val overshoot = ((distToRoad - maxRoadRadius) / maxRoadRadius).coerceIn(0.0, 1.0)
-                                currentSpeed *= (1.0 - 0.30 * overshoot)
-                                // Dirección de la calle: muestreamos un punto ~22 m adelante en el sentido
-                                // del coche y vemos hacia dónde sigue la red.
-                                val aheadRoad = getNearestPointOnNetwork(
-                                    GeoPoint(nearestRoadPoint.latitude + cos(angleRad) * 0.0002,
-                                        nearestRoadPoint.longitude + sin(angleRad) * 0.0002)
-                                )
-                                var roadBearing = Math.toDegrees(
-                                    atan2(aheadRoad.longitude - nearestRoadPoint.longitude,
-                                        aheadRoad.latitude - nearestRoadPoint.latitude)
-                                ).toFloat()
-                                // Que apunte hacia donde VA el coche (no al sentido contrario).
-                                var diff = ((roadBearing - currentRotation + 540f) % 360f) - 180f
-                                if (kotlin.math.abs(diff) > 90f) {
-                                    roadBearing = (roadBearing + 180f) % 360f
-                                    diff = ((roadBearing - currentRotation + 540f) % 360f) - 180f
+                            // 👇 ADUANA DE CHOQUE PARA EL COCHE 👇
+                            if (isCollisionDetected(location.latitude, location.longitude, tempLoc.latitude, tempLoc.longitude)) {
+                                // Frena en seco (Speed = 0) y anula el choque
+                                _uiState.update {
+                                    it.copy(
+                                        vehicleSpeed = 0.0,
+                                        vehicleRotation = (currentRotation + 360) % 360f
+                                    )
                                 }
-                                currentRotation += diff * 0.35f   // giro SUAVE hacia la calle
-                                nearestRoadPoint                  // pegado a la calle pero SIN detenerse
-                            }
+                            } else {
+                                // Lógica de 'main': Auto-centrado y límite dinámico de la calle
+                                val distToRoad = distance(tempLoc, nearestRoadPoint)
+                                // Expandimos el radio temporalmente para permitir salirnos un poco al rebasar
+                                val maxRoadRadius = if (dodgeOffsetX != 0.0 || dodgeOffsetY != 0.0 || isAutoCentering) 0.00006 else 0.00004
 
-                            _uiState.update {
-                                it.copy(
-                                    currentLocation = finalLoc,
-                                    vehicleSpeed = currentSpeed,
-                                    vehicleRotation = (currentRotation + 360) % 360f
-                                )
-                            }
+                                val finalLoc = if (distToRoad <= maxRoadRadius) {
+                                    tempLoc
+                                } else {
+                                    // Te saliste (curva/bifurcación): en vez de "chocar y pararte", AUTO-DIRECCIONA
+                                    // el coche hacia la calle y baja la velocidad de forma PROPORCIONAL (drástica
+                                    // solo en desvíos grandes). Así, dejando acelerar, el coche SIGUE la carretera.
+                                    val overshoot = ((distToRoad - maxRoadRadius) / maxRoadRadius).coerceIn(0.0, 1.0)
+                                    currentSpeed *= (1.0 - 0.30 * overshoot)
+                                    // Dirección de la calle: muestreamos un punto ~22 m adelante en el sentido
+                                    // del coche y vemos hacia dónde sigue la red.
+                                    val aheadRoad = getNearestPointOnNetwork(
+                                        GeoPoint(nearestRoadPoint.latitude + cos(angleRad) * 0.0002,
+                                            nearestRoadPoint.longitude + sin(angleRad) * 0.0002)
+                                    )
+                                    var roadBearing = Math.toDegrees(
+                                        atan2(aheadRoad.longitude - nearestRoadPoint.longitude,
+                                            aheadRoad.latitude - nearestRoadPoint.latitude)
+                                    ).toFloat()
+                                    // Que apunte hacia donde VA el coche (no al sentido contrario).
+                                    var diff = ((roadBearing - currentRotation + 540f) % 360f) - 180f
+                                    if (kotlin.math.abs(diff) > 90f) {
+                                        roadBearing = (roadBearing + 180f) % 360f
+                                        diff = ((roadBearing - currentRotation + 540f) % 360f) - 180f
+                                    }
+                                    currentRotation += diff * 0.35f
+                                    nearestRoadPoint
+                                }
 
-                            // ATROPELLO: conduciendo, los peatones/zombis dentro de RUN_OVER_RADIUS
-                            // reciben daño escalado con la velocidad. (Antes solo se llamaba en la
-                            // extensión WorldMapGameLoop.kt, que está SOMBREADA por este loop miembro.)
-                            val isAutoDodging = dodgeOffsetX != 0.0 || dodgeOffsetY != 0.0
-                            if (isAutoDodging) lastDodgeTime = System.currentTimeMillis()
-                            // Cancelar inmunidad si el jugador gira voluntariamente (para permitir chocar intencionalmente)
-                            if (isSteeringSharply) lastDodgeTime = 0L
-                            val dodgeGrace = System.currentTimeMillis() - lastDodgeTime < 600L
-                            runOverNpcs(finalLoc, currentSpeed, dodgeGrace)
+                                _uiState.update {
+                                    it.copy(
+                                        currentLocation = finalLoc,
+                                        vehicleSpeed = currentSpeed,
+                                        vehicleRotation = (currentRotation + 360) % 360f
+                                    )
+                                }
+
+                                // ATROPELLO: Lógica de esquive de 'main'
+                                val isAutoDodging = dodgeOffsetX != 0.0 || dodgeOffsetY != 0.0
+                                if (isAutoDodging) lastDodgeTime = System.currentTimeMillis()
+                                // Cancelar inmunidad si el jugador gira voluntariamente (para permitir chocar intencionalmente)
+                                if (isSteeringSharply) lastDodgeTime = 0L
+                                val dodgeGrace = System.currentTimeMillis() - lastDodgeTime < 600L
+                                runOverNpcs(finalLoc, currentSpeed, dodgeGrace)
+                            }
                         }
 
                         // GOLPES/MORDIDAS por CONTACTO: NPCs agresivos en embestida y ZOMBIS cercanos
@@ -859,6 +869,36 @@ class WorldMapViewModel(
     }
 
     fun stopGameLoop() { gameLoopJob?.cancel(); gameLoopJob = null }
+
+    private var exteriorCollisions: ExteriorCollisionsConfig? = null
+
+    // Llama esta función en el init{} de tu ViewModel
+    private fun loadExteriorCollisions(context: Context) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val jsonString = context.assets.open("exterior_collisions.json").bufferedReader().use { it.readText() }
+                exteriorCollisions = Gson().fromJson(jsonString, ExteriorCollisionsConfig::class.java)
+
+                npcAiManager.setExteriorCollisions(exteriorCollisions)
+
+            } catch (e: Exception) {
+                Log.e("Collisions", "Error: ${e.message}")
+            }
+        }
+    }
+
+    private fun isCollisionDetected(oldLat: Double, oldLon: Double, newLat: Double, newLon: Double): Boolean {
+        val config = exteriorCollisions ?: return false
+        // A) Revisar si pisa un edificio
+        for (poly in config.polygons) {
+            if (poly.contains(newLat, newLon)) return true
+        }
+        // B) Revisar si choca con una barda
+        for (wall in config.walls) {
+            if (wall.didHitWall(oldLat, oldLon, newLat, newLon)) return true
+        }
+        return false
+    }
 
     private suspend fun applyRoadNetwork(network: List<MapWay>, playerLocation: GeoPoint) {
         roadNetwork = network
@@ -1227,6 +1267,12 @@ class WorldMapViewModel(
             Direction.LEFT  -> GeoPoint(loc.latitude, loc.longitude - step)
             Direction.RIGHT -> GeoPoint(loc.latitude, loc.longitude + step)
         }
+
+        // ADUANA DE CHOQUE A PIE
+        if (isCollisionDetected(loc.latitude, loc.longitude, temp.latitude, temp.longitude)) {
+            return // CHOCÓ: Rompemos la función y el jugador no avanza
+        }
+
         val nearest = getNearestPointOnNetwork(temp)
         val dist    = distance(temp, nearest)
         val radius  = 0.000012
@@ -1258,6 +1304,11 @@ class WorldMapViewModel(
             loc.latitude + sin(angleRad) * step,
             loc.longitude + cos(angleRad) * step
         )
+
+        // ADUANA DE CHOQUE JOYSTICK
+        if (isCollisionDetected(loc.latitude, loc.longitude, temp.latitude, temp.longitude)) {
+            return // CHOCÓ: Rompemos la función
+        }
 
         val nearest = getNearestPointOnNetwork(temp)
         val dist = distance(temp, nearest)
@@ -1817,6 +1868,7 @@ class WorldMapViewModel(
     }
 
     fun loadLandmarks(context: Context) {
+        loadExteriorCollisions(context) // ESTO CARGA EL JSON DE MUROS
         loadMetroStations(context)
         viewModelScope.launch(Dispatchers.IO) {
             try {
